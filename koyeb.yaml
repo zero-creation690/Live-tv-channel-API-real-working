@@ -1,0 +1,14 @@
+name: iptv-fast-api
+regions:
+  - fra # (Frankfurt - closest for Asia)
+services:
+  - name: iptv-api
+    env:
+      - key: PORT
+        value: "8080"
+    ports:
+      - port: 8080
+        protocol: http
+    build:
+      type: docker
+    run_command: python app.py

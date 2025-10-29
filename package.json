@@ -1,28 +1,13 @@
 {
-  "name": "iptv-api",
+  "name": "iptv-search-api",
   "version": "1.0.0",
-  "description": "IPTV Search API with filters for channels, streams, and logos - Created by https://t.me/zerodevbro",
-  "main": "api/index.js",
+  "description": "IPTV Channel Search API",
+  "main": "index.js",
   "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
+    "dev": "vercel dev"
   },
-  "keywords": [
-    "iptv",
-    "api",
-    "streams",
-    "channels",
-    "search",
-    "m3u8"
-  ],
-  "author": "zerodevbro (https://t.me/zerodevbro)",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/iptv-org/api"
+  "dependencies": {
+    "@vercel/node": "^2.0.0"
   },
-  "dependencies": {},
-  "devDependencies": {
-    "vercel": "^33.0.0"
-  }
+  "license": "MIT"
 }

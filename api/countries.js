@@ -1,103 +1,55 @@
-// API endpoint for countries list with channels
-// Created by https://t.me/zerodevbro
-
-const channels = require('../data/channels.json');
-const countries = require('../data/countries.json');
-const streams = require('../data/streams.json');
-const logos = require('../data/logos.json');
+const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  // CORS headers
+  // Enable CORS
+  res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
   if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+    res.status(200).end();
+    return;
   }
 
-  const { code, includeChannels } = req.query;
-
   try {
-    let countriesData = countries.map(country => {
-      const countryChannels = channels.filter(c => c.country === country.code);
-      const channelCount = countryChannels.length;
+    const channelsResponse = await fetch('https://iptv-org.github.io/api/channels.json');
+    const channels = await channelsResponse.json();
+    
+    const countriesResponse = await fetch('https://iptv-org.github.io/api/countries.json');
+    const countries = await countriesResponse.json();
 
-      let result = {
-        name: country.name,
-        code: country.code,
-        flag: country.flag,
-        languages: country.languages || [],
-        channelCount: channelCount
-      };
-
-      // Include full channel data if requested
-      if (includeChannels === 'true' || code === country.code) {
-        result.channels = countryChannels.map(channel => {
-          const channelStreams = streams.filter(s => s.channel === channel.id);
-          const channelLogos = logos.filter(l => l.channel === channel.id);
-          
-          return {
-            id: channel.id,
-            name: channel.name,
-            alternativeNames: channel.alt_names || [],
-            network: channel.network || null,
-            categories: channel.categories || [],
-            isNsfw: channel.is_nsfw || false,
-            website: channel.website || null,
-            streams: channelStreams.map(stream => ({
-              title: stream.title || null,
-              url: stream.url,
-              quality: stream.quality || null
-            })),
-            logos: channelLogos.map(logo => ({
-              url: logo.url,
-              width: logo.width,
-              height: logo.height,
-              format: logo.format || null
-            }))
-          };
-        });
+    // Count channels per country
+    const countryCounts = channels.reduce((acc, channel) => {
+      if (channel.country) {
+        acc[channel.country] = (acc[channel.country] || 0) + 1;
       }
+      return acc;
+    }, {});
 
-      return result;
-    });
+    // Enrich countries with channel counts
+    const countriesWithCounts = countries
+      .filter(country => countryCounts[country.code])
+      .map(country => ({
+        code: country.code,
+        name: country.name,
+        flag: country.flag,
+        channel_count: countryCounts[country.code] || 0,
+        languages: country.languages
+      }))
+      .sort((a, b) => b.channel_count - a.channel_count);
 
-    // Filter by country code if specified
-    if (code) {
-      countriesData = countriesData.filter(c => 
-        c.code.toLowerCase() === code.toLowerCase()
-      );
-    }
-
-    // Only show countries with channels
-    countriesData = countriesData.filter(c => c.channelCount > 0);
-
-    // Sort by channel count
-    countriesData.sort((a, b) => b.channelCount - a.channelCount);
-
-    res.status(200).json({
+    res.json({
       success: true,
-      timestamp: new Date().toISOString(),
-      count: countriesData.length,
-      totalChannels: countriesData.reduce((sum, c) => sum + c.channelCount, 0),
-      query: {
-        code: code || null,
-        includeChannels: includeChannels === 'true'
-      },
-      creator: "https://t.me/zerodevbro",
-      data: countriesData
+      data: countriesWithCounts,
+      total: countriesWithCounts.length
     });
+
   } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({
       success: false,
-      timestamp: new Date().toISOString(),
-      error: {
-        message: error.message,
-        code: "INTERNAL_ERROR"
-      },
-      creator: "https://t.me/zerodevbro"
+      error: 'Internal server error'
     });
   }
 };

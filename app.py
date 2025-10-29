@@ -11,7 +11,6 @@ SEARCH_INDEX = {}
 LAST_UPDATE = 0
 CACHE_DURATION = 3600 * 3  # 3 hours
 
-
 def fetch_all_data():
     """Fetch all IPTV JSON data and preprocess"""
     global DATA, SEARCH_INDEX, LAST_UPDATE
@@ -53,11 +52,9 @@ def auto_refresh():
         fetch_all_data()
 
 
-@app.before_first_request
-def startup():
-    """Load data on first API hit"""
-    fetch_all_data()
-    threading.Thread(target=auto_refresh, daemon=True).start()
+# Start data fetching and refresh in background immediately
+threading.Thread(target=fetch_all_data, daemon=True).start()
+threading.Thread(target=auto_refresh, daemon=True).start()
 
 
 def combine_channel_data(channel):
@@ -117,7 +114,7 @@ def search():
         if q in ch["name"] or any(q in alt for alt in ch["alt"]):
             original = next(c for c in DATA["channels"] if c["id"] == ch_id)
             results.append(combine_channel_data(original))
-            if len(results) >= 50:
+            if len(results) >= 50:  # Limit for fast response
                 break
 
     return app.response_class(

@@ -1,47 +1,20 @@
 {
   "version": 2,
-  "name": "iptv-api",
-  "builds": [
+  "routes": [
     {
-      "src": "api/**/*.js",
-      "use": "@vercel/node"
-    }
-  ],
-  "rewrites": [
+      "src": "/api/channels",
+      "methods": ["GET"],
+      "dest": "/api/channels.js"
+    },
     {
-      "source": "/",
-      "destination": "/api/index"
-    }
-  ],
-  "headers": [
+      "src": "/api/countries",
+      "methods": ["GET"],
+      "dest": "/api/countries.js"
+    },
     {
-      "source": "/api/(.*)",
-      "headers": [
-        {
-          "key": "Access-Control-Allow-Origin",
-          "value": "*"
-        },
-        {
-          "key": "Access-Control-Allow-Methods",
-          "value": "GET, POST, OPTIONS"
-        },
-        {
-          "key": "Access-Control-Allow-Headers",
-          "value": "Content-Type, Authorization"
-        },
-        {
-          "key": "X-Content-Type-Options",
-          "value": "nosniff"
-        },
-        {
-          "key": "X-Frame-Options",
-          "value": "DENY"
-        },
-        {
-          "key": "X-XSS-Protection",
-          "value": "1; mode=block"
-        }
-      ]
+      "src": "/api/search",
+      "methods": ["GET"],
+      "dest": "/api/search.js"
     }
   ]
 }

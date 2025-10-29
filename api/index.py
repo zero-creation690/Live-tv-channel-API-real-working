@@ -1,43 +1,36 @@
 import os
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
+from datetime import datetime, timedelta
 from threading import Lock
-import json # Used for potential pre-built data loading
+
+# --- Configuration ---
+IPTV_API_BASE_URL = "https://iptv-org.github.io/api"
+# Cache duration for data refresh if the serverless container stays warm
+CACHE_DURATION = timedelta(hours=6)
 
 # --- Global Data Cache and Lock ---
-# Using a dictionary to hold all pre-processed and indexed data
-GLOBAL_DATA_CACHE = {
+# This data will persist in memory across "warm" serverless function invocations.
+GLOBAL_CACHE = {
     'is_loaded': False,
-    'channels': [],
-    'streams_map': {}, # {channel_id: [stream_objects]}
-    'logos_map': {},   # {channel_id: logo_url}
-    'countries': [],
-    'countries_map': {}, # {country_code: country_object}
-    'channel_counts': {}, # {country_code: count}
+    'last_loaded': None,
+    # Indexed data for fast lookup
+    'channels_list': [],  # Primary list for search/country filtering
+    'channels_map': {},   # {channel_id: channel_object} for instant lookup
+    'streams_map': {},    # {channel_id: [stream_objects]}
+    'logos_map': {},      # {channel_id: logo_url}
+    'countries_map': {},  # {code: country_object}
+    'channel_counts': {}, # {code: count}
 }
 
 DATA_LOCK = Lock()
-# Note: In a true production environment, especially serverless,
-# this data should ideally be built once and loaded from a
-# persistent external store (like S3 or a DB) on startup.
-# For this example, we'll keep the direct API fetching logic.
-
-# --- Vercel Environment Configuration (Important) ---
-# Vercel's serverless functions are essentially one-time execution scripts.
-# The global variables persist across "warm" invocations.
-# The base URL should be set as an environment variable or a constant.
-IPTV_API_BASE_URL = os.environ.get("IPTV_API_BASE_URL", "https://iptv-org.github.io/api")
 
 app = Flask(__name__)
 CORS(app)
 
-def fetch_and_process_data():
-    """
-    Fetches all data and processes it into optimized, indexed structures.
-    This function should run only once.
-    """
-    print("--- Starting data fetch and processing ---")
+def fetch_external_data():
+    """Fetches and parses all external JSON data."""
     data_urls = {
         'channels': f"{IPTV_API_BASE_URL}/channels.json",
         'streams': f"{IPTV_API_BASE_URL}/streams.json",
@@ -46,24 +39,30 @@ def fetch_and_process_data():
     }
     
     data = {}
-    for data_type, url in data_urls.items():
-        try:
-            # Increased timeout to 30 seconds for initial large payload fetch
-            response = requests.get(url, timeout=30) 
+    print(f"[{datetime.now().isoformat()}] Fetching large external data...")
+    try:
+        # Give a long timeout for the initial massive data fetch (critical for Vercel)
+        for data_type, url in data_urls.items():
+            response = requests.get(url, timeout=45) 
             response.raise_for_status()
             data[data_type] = response.json()
-        except requests.RequestException as e:
-            print(f"Error fetching {data_type}: {e}")
-            # In a serverless environment, if initial fetch fails, subsequent
-            # requests will fail until the next cold start.
-            return False
+        return data
+    except requests.RequestException as e:
+        print(f"CRITICAL ERROR during initial data fetch: {e}")
+        return None
 
-    # --- Step 1: Process Logos into a fast lookup map ---
-    logos_map = {logo['channel']: logo['url'] for logo in data.get('logos', [])}
-    
-    # --- Step 2: Process Streams into a fast lookup map ---
+def initialize_and_index_data():
+    """Initializes the global cache by fetching, indexing, and merging data."""
+    raw_data = fetch_external_data()
+    if raw_data is None:
+        return False
+        
+    print(f"[{datetime.now().isoformat()}] Indexing data for fast access...")
+
+    # 1. Index Logos and Streams for O(1) lookups
+    logos_map = {logo['channel']: logo['url'] for logo in raw_data.get('logos', [])}
     streams_map = {}
-    for stream in data.get('streams', []):
+    for stream in raw_data.get('streams', []):
         channel_id = stream.get('channel')
         if channel_id:
             streams_map.setdefault(channel_id, []).append({
@@ -74,56 +73,68 @@ def fetch_and_process_data():
                 'user_agent': stream.get('user_agent')
             })
 
-    # --- Step 3: Combine and Store Processed Data ---
-    channels = data.get('channels', [])
+    # 2. Combine Channel data and create fast lookup structures
+    channels_list = raw_data.get('channels', [])
+    channels_map = {}
     channel_counts = {}
     
-    # This pre-processing is key: we only iterate over streams/logos ONCE here.
-    # The 'channels' list remains as the primary source for search.
-    
-    for ch in channels:
-        ch['logo'] = logos_map.get(ch['id'])
-        ch['streams'] = streams_map.get(ch['id'], [])
+    # Merge stream and logo data directly into the channel objects once
+    for channel in channels_list:
+        ch_id = channel['id']
         
-        # Pre-count channels by country
-        cc = ch.get('country')
+        # Add pre-indexed streams/logos
+        channel['logo'] = logos_map.get(ch_id)
+        channel['streams'] = streams_map.get(ch_id, [])
+        
+        channels_map[ch_id] = channel
+        
+        # Count channels per country
+        cc = channel.get('country')
         if cc:
             channel_counts[cc] = channel_counts.get(cc, 0) + 1
 
-    # --- Step 4: Process Countries ---
-    countries = data.get('countries', [])
-    countries_map = {c['code']: c for c in countries}
+    # 3. Index Countries
+    countries_map = {c['code']: c for c in raw_data.get('countries', [])}
     
-    # --- Update Global Cache ---
-    GLOBAL_DATA_CACHE.update({
-        'channels': channels,
+    # --- Update Global Cache (Atomic Update) ---
+    GLOBAL_CACHE.update({
+        'channels_list': channels_list,
+        'channels_map': channels_map,
         'streams_map': streams_map,
         'logos_map': logos_map,
-        'countries': countries,
         'countries_map': countries_map,
         'channel_counts': channel_counts,
+        'last_loaded': datetime.now(),
         'is_loaded': True
     })
     
-    print("--- Data processing complete. Cache is ready. ---")
+    print(f"[{datetime.now().isoformat()}] Data indexing successful. Channels: {len(channels_list)}")
     return True
 
-def ensure_data_loaded(func):
-    """Decorator to ensure data is loaded before processing a request."""
+def ensure_data_ready(func):
+    """Decorator to ensure data is loaded and potentially refreshed."""
     def wrapper(*args, **kwargs):
         with DATA_LOCK:
-            if not GLOBAL_DATA_CACHE['is_loaded']:
-                if not fetch_and_process_data():
+            now = datetime.now()
+            should_refresh = (
+                GLOBAL_CACHE['is_loaded'] == False or
+                (GLOBAL_CACHE['last_loaded'] and (now - GLOBAL_CACHE['last_loaded'] > CACHE_DURATION))
+            )
+            
+            if should_refresh:
+                if not initialize_and_index_data():
+                    # Return 503 if the initial fetch failed
                     return jsonify({
-                        'error': 'Failed to load initial data from IPTV API',
+                        'error': 'Service Unavailable: Failed to load required external data.',
                         'created_by': 'https://t.me/zerodevbro'
-                    }), 503 # Service Unavailable
+                    }), 503 
+        
+        # Data is loaded (or refreshed), proceed with the request
         return func(*args, **kwargs)
     return wrapper
 
-# --- The function to combine data is now a simple lookup (eliminated streams/logos iteration) ---
 def prepare_channel_response(channel):
-    """Prepares a single channel object for the API response."""
+    """Formats the channel object for final response."""
     return {
         'id': channel['id'],
         'name': channel['name'],
@@ -131,35 +142,35 @@ def prepare_channel_response(channel):
         'country': channel['country'],
         'network': channel.get('network'),
         'categories': channel.get('categories', []),
-        'logo': channel.get('logo'), # Pre-added during processing
-        'streams': channel.get('streams', []), # Pre-added during processing
+        'logo': channel.get('logo'),
+        # Streams were merged during indexing, ensuring speed
+        'streams': channel.get('streams', []), 
         'website': channel.get('website'),
         'is_nsfw': channel.get('is_nsfw', False),
         'launched': channel.get('launched'),
         'created_by': 'https://t.me/zerodevbro'
     }
 
-# --- API Endpoints (Now much faster) ---
+# --- API Endpoints ---
 
 @app.route('/')
-@ensure_data_loaded
+@ensure_data_ready
 def home():
     return jsonify({
-        'message': 'IPTV Channel Search API (Optimized for Vercel)',
+        'message': 'IPTV Channel Search API (Serverless Optimized)',
         'created_by': 'https://t.me/zerodevbro',
         'endpoints': {
             '/api/search?q=<channel_name>': 'Search channels by name',
             '/api/country/<country_code>': 'Get all channels by country',
             '/api/countries': 'List all available countries',
-            '/api/channel/<channel_id>': 'Get specific channel details',
-            '/api/categories': 'List all categories'
+            '/api/channel/<channel_id>': 'Get specific channel details'
         }
     })
 
 @app.route('/api/search')
-@ensure_data_loaded
+@ensure_data_ready
 def search_channels():
-    """Search channels by name - Faster, only iterates over channels"""
+    """Search channels by name - Now uses the pre-indexed channels list."""
     query = request.args.get('q', '').lower()
     
     if not query:
@@ -168,10 +179,10 @@ def search_channels():
             'created_by': 'https://t.me/zerodevbro'
         }), 400
     
-    channels = GLOBAL_DATA_CACHE['channels']
+    channels = GLOBAL_CACHE['channels_list']
     
     results = []
-    # This loop is still necessary but the prepare_channel_response inside is now instant.
+    # This iteration is fast because the channel object already contains streams/logos.
     for channel in channels:
         if (query in channel['name'].lower() or 
             any(query in alt.lower() for alt in channel.get('alt_names', []))):
@@ -185,11 +196,11 @@ def search_channels():
     })
 
 @app.route('/api/country/<country_code>')
-@ensure_data_loaded
+@ensure_data_ready
 def get_by_country(country_code):
-    """Get all channels by country code - Much faster iteration"""
+    """Get all channels by country code - Fast iteration over pre-indexed data."""
     country_code = country_code.upper()
-    channels = GLOBAL_DATA_CACHE['channels']
+    channels = GLOBAL_CACHE['channels_list']
     
     country_channels = [
         prepare_channel_response(ch) for ch in channels 
@@ -210,18 +221,18 @@ def get_by_country(country_code):
     })
 
 @app.route('/api/countries')
-@ensure_data_loaded
+@ensure_data_ready
 def list_countries():
-    """List all available countries - Using pre-counted data"""
-    countries = GLOBAL_DATA_CACHE['countries']
-    channel_counts = GLOBAL_DATA_CACHE['channel_counts']
+    """List all available countries - Using pre-counted data for speed."""
+    countries_map = GLOBAL_CACHE['countries_map']
+    channel_counts = GLOBAL_CACHE['channel_counts']
     
     countries_list = [{
-        'code': c['code'],
-        'name': c['name'],
-        'flag': c['flag'],
-        'channel_count': channel_counts.get(c['code'], 0)
-    } for c in countries if channel_counts.get(c['code'], 0) > 0]
+        'code': code,
+        'name': countries_map[code]['name'],
+        'flag': countries_map[code]['flag'],
+        'channel_count': count
+    } for code, count in channel_counts.items()]
     
     return jsonify({
         'total_countries': len(countries_list),
@@ -230,15 +241,10 @@ def list_countries():
     })
 
 @app.route('/api/channel/<channel_id>')
-@ensure_data_loaded
+@ensure_data_ready
 def get_channel(channel_id):
-    """Get specific channel by ID - Now uses a fast dictionary lookup (indirectly)"""
-    channels = GLOBAL_DATA_CACHE['channels']
-    
-    # We must still iterate here, but for a single item. 
-    # For maximum speed, you'd create a map: channel_map = {ch['id']: ch for ch in channels}
-    # But keeping one list simplifies the overall structure.
-    channel = next((ch for ch in channels if ch['id'] == channel_id), None)
+    """Get specific channel by ID - Instant lookup via map."""
+    channel = GLOBAL_CACHE['channels_map'].get(channel_id)
     
     if not channel:
         return jsonify({
@@ -252,10 +258,10 @@ def get_channel(channel_id):
     })
 
 @app.route('/api/categories')
-@ensure_data_loaded
+@ensure_data_ready
 def list_categories():
-    """List all channel categories - Still requires iteration but is fast for a full list"""
-    channels = GLOBAL_DATA_CACHE['channels']
+    """List all channel categories."""
+    channels = GLOBAL_CACHE['channels_list']
     
     categories = {}
     for channel in channels:
@@ -268,16 +274,9 @@ def list_categories():
         'created_by': 'https://t.me/zerodevbro'
     })
 
-# --- Vercel/Production Run Configuration ---
-
-# Vercel needs the application object for deployment
-# The command for Vercel should reference this file and the 'app' object, e.g., 'vercel' or 'gunicorn app:app'
-
-# For local development, keep the main block
 if __name__ == '__main__':
-    # Initial load will happen here for local development. 
-    # On Vercel, it happens on the first request (cold start).
+    # Initial load attempt for local testing
     with DATA_LOCK:
-        fetch_and_process_data()
-    app.run(debug=True, port=5000)
-
+        initialize_and_index_data()
+    # In Vercel, this block is ignored, and the data load occurs on the first request via the decorator.
+    app.run(debug=True)

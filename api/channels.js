@@ -1,95 +1,109 @@
-// API endpoint for channel search
-// Created by https://t.me/zerodevbro
-
-const channels = require('../data/channels.json');
-const streams = require('../data/streams.json');
-const logos = require('../data/logos.json');
+const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  // CORS headers
+  // Enable CORS
+  res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
   if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+    res.status(200).end();
+    return;
   }
 
-  const { search, country } = req.query;
-
   try {
-    let results = channels.map(channel => {
-      const channelStreams = streams.filter(s => s.channel === channel.id);
-      const channelLogos = logos.filter(l => l.channel === channel.id);
+    const { country, search, category, limit = 50 } = req.query;
+    
+    // Fetch channels data
+    const channelsResponse = await fetch('https://iptv-org.github.io/api/channels.json');
+    let channels = await channelsResponse.json();
+    
+    // Fetch streams data
+    const streamsResponse = await fetch('https://iptv-org.github.io/api/streams.json');
+    const streams = await streamsResponse.json();
+    
+    // Fetch logos data
+    const logosResponse = await fetch('https://iptv-org.github.io/api/logos.json');
+    const logos = await logosResponse.json();
+    
+    // Fetch countries data
+    const countriesResponse = await fetch('https://iptv-org.github.io/api/countries.json');
+    const countries = await countriesResponse.json();
+
+    // Combine data
+    const enrichedChannels = channels.map(channel => {
+      // Find streams for this channel
+      const channelStreams = streams.filter(stream => 
+        stream.channel === channel.id || stream.feed === channel.id
+      );
+      
+      // Find logo for this channel
+      const channelLogo = logos.find(logo => 
+        logo.channel === channel.id && !logo.feed
+      ) || logos.find(logo => logo.channel === channel.id);
+      
+      // Find country info
+      const countryInfo = countries.find(c => c.code === channel.country);
       
       return {
         id: channel.id,
         name: channel.name,
-        alternativeNames: channel.alt_names || [],
-        network: channel.network || null,
-        owners: channel.owners || [],
-        country: channel.country || null,
-        categories: channel.categories || [],
-        isNsfw: channel.is_nsfw || false,
-        launched: channel.launched || null,
-        closed: channel.closed || null,
-        replacedBy: channel.replaced_by || null,
-        website: channel.website || null,
+        alt_names: channel.alt_names,
+        country: channel.country,
+        country_name: countryInfo ? countryInfo.name : null,
+        country_flag: countryInfo ? countryInfo.flag : null,
+        categories: channel.categories,
+        network: channel.network,
+        website: channel.website,
+        is_nsfw: channel.is_nsfw,
+        logo: channelLogo ? channelLogo.url : null,
         streams: channelStreams.map(stream => ({
-          title: stream.title || null,
           url: stream.url,
-          quality: stream.quality || null,
-          referrer: stream.referrer || null,
-          userAgent: stream.user_agent || null
-        })),
-        logos: channelLogos.map(logo => ({
-          url: logo.url,
-          width: logo.width,
-          height: logo.height,
-          format: logo.format || null,
-          tags: logo.tags || []
+          quality: stream.quality,
+          title: stream.title,
+          referrer: stream.referrer
         }))
       };
     });
 
-    // Filter by country
+    // Apply filters
+    let filteredChannels = enrichedChannels;
+
     if (country) {
-      results = results.filter(c => 
-        c.country?.toLowerCase() === country.toLowerCase()
+      filteredChannels = filteredChannels.filter(channel => 
+        channel.country === country.toUpperCase()
       );
     }
 
-    // Filter by search query
     if (search) {
       const searchLower = search.toLowerCase();
-      results = results.filter(c => 
-        c.name?.toLowerCase().includes(searchLower) ||
-        c.alternativeNames?.some(name => name.toLowerCase().includes(searchLower)) ||
-        c.network?.toLowerCase().includes(searchLower)
+      filteredChannels = filteredChannels.filter(channel =>
+        channel.name.toLowerCase().includes(searchLower) ||
+        channel.alt_names.some(alt => alt.toLowerCase().includes(searchLower))
       );
     }
 
-    res.status(200).json({
+    if (category) {
+      filteredChannels = filteredChannels.filter(channel =>
+        channel.categories.includes(category.toLowerCase())
+      );
+    }
+
+    // Apply limit
+    filteredChannels = filteredChannels.slice(0, parseInt(limit));
+
+    res.json({
       success: true,
-      timestamp: new Date().toISOString(),
-      count: results.length,
-      query: {
-        search: search || null,
-        country: country || null
-      },
-      creator: "https://t.me/zerodevbro",
-      data: results
+      data: filteredChannels,
+      total: filteredChannels.length
     });
+
   } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({
       success: false,
-      timestamp: new Date().toISOString(),
-      error: {
-        message: error.message,
-        code: "INTERNAL_ERROR"
-      },
-      creator: "https://t.me/zerodevbro"
+      error: 'Internal server error'
     });
   }
 };

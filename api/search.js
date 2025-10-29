@@ -1,141 +1,109 @@
-// API endpoint for advanced search with multiple filters
-// Created by https://t.me/zerodevbro
-
-const channels = require('../data/channels.json');
-const streams = require('../data/streams.json');
-const logos = require('../data/logos.json');
+const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  // CORS headers
+  // Enable CORS
+  res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
   if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+    res.status(200).end();
+    return;
   }
 
-  const { 
-    q, 
-    country, 
-    category, 
-    nsfw, 
-    hasStreams,
-    limit = 50,
-    offset = 0 
-  } = req.query;
-
   try {
-    let results = channels.map(channel => {
-      const channelStreams = streams.filter(s => s.channel === channel.id);
-      const channelLogos = logos.filter(l => l.channel === channel.id);
+    const { q, country, category, limit = 20 } = req.query;
+    
+    if (!q) {
+      return res.status(400).json({
+        success: false,
+        error: 'Search query (q) is required'
+      });
+    }
+
+    // Fetch all data
+    const [channelsResponse, streamsResponse, logosResponse, countriesResponse] = await Promise.all([
+      fetch('https://iptv-org.github.io/api/channels.json'),
+      fetch('https://iptv-org.github.io/api/streams.json'),
+      fetch('https://iptv-org.github.io/api/logos.json'),
+      fetch('https://iptv-org.github.io/api/countries.json')
+    ]);
+
+    const channels = await channelsResponse.json();
+    const streams = await streamsResponse.json();
+    const logos = await logosResponse.json();
+    const countries = await countriesResponse.json();
+
+    const searchTerm = q.toLowerCase();
+    
+    // Search channels
+    let results = channels.filter(channel => {
+      const nameMatch = channel.name.toLowerCase().includes(searchTerm);
+      const altMatch = channel.alt_names && channel.alt_names.some(alt => 
+        alt.toLowerCase().includes(searchTerm)
+      );
+      
+      return nameMatch || altMatch;
+    });
+
+    // Apply country filter
+    if (country) {
+      results = results.filter(channel => channel.country === country.toUpperCase());
+    }
+
+    // Apply category filter
+    if (category) {
+      results = results.filter(channel => 
+        channel.categories.includes(category.toLowerCase())
+      );
+    }
+
+    // Enrich results with additional data
+    const enrichedResults = results.slice(0, parseInt(limit)).map(channel => {
+      const channelStreams = streams.filter(stream => 
+        stream.channel === channel.id || stream.feed === channel.id
+      );
+      
+      const channelLogo = logos.find(logo => 
+        logo.channel === channel.id && !logo.feed
+      ) || logos.find(logo => logo.channel === channel.id);
+      
+      const countryInfo = countries.find(c => c.code === channel.country);
       
       return {
         id: channel.id,
         name: channel.name,
-        alternativeNames: channel.alt_names || [],
-        network: channel.network || null,
-        owners: channel.owners || [],
-        country: channel.country || null,
-        categories: channel.categories || [],
-        isNsfw: channel.is_nsfw || false,
-        launched: channel.launched || null,
-        closed: channel.closed || null,
-        replacedBy: channel.replaced_by || null,
-        website: channel.website || null,
-        streamCount: channelStreams.length,
-        logoCount: channelLogos.length,
+        alt_names: channel.alt_names,
+        country: channel.country,
+        country_name: countryInfo ? countryInfo.name : null,
+        country_flag: countryInfo ? countryInfo.flag : null,
+        categories: channel.categories,
+        network: channel.network,
+        website: channel.website,
+        is_nsfw: channel.is_nsfw,
+        logo: channelLogo ? channelLogo.url : null,
         streams: channelStreams.map(stream => ({
-          title: stream.title || null,
           url: stream.url,
-          quality: stream.quality || null,
-          referrer: stream.referrer || null,
-          userAgent: stream.user_agent || null,
-          feed: stream.feed || null
-        })),
-        logos: channelLogos.map(logo => ({
-          url: logo.url,
-          width: logo.width,
-          height: logo.height,
-          format: logo.format || null,
-          tags: logo.tags || [],
-          feed: logo.feed || null
+          quality: stream.quality,
+          title: stream.title,
+          referrer: stream.referrer
         }))
       };
     });
 
-    // Apply filters
-    if (q) {
-      const searchLower = q.toLowerCase();
-      results = results.filter(c => 
-        c.name?.toLowerCase().includes(searchLower) ||
-        c.alternativeNames?.some(name => name.toLowerCase().includes(searchLower)) ||
-        c.network?.toLowerCase().includes(searchLower) ||
-        c.owners?.some(owner => owner.toLowerCase().includes(searchLower))
-      );
-    }
-
-    if (country) {
-      results = results.filter(c => 
-        c.country?.toLowerCase() === country.toLowerCase()
-      );
-    }
-
-    if (category) {
-      results = results.filter(c => 
-        c.categories?.some(cat => cat.toLowerCase() === category.toLowerCase())
-      );
-    }
-
-    if (nsfw !== undefined) {
-      const nsfwValue = nsfw === 'true';
-      results = results.filter(c => c.isNsfw === nsfwValue);
-    }
-
-    if (hasStreams === 'true') {
-      results = results.filter(c => c.streamCount > 0);
-    }
-
-    // Sort by relevance (channels with streams first)
-    results.sort((a, b) => b.streamCount - a.streamCount);
-
-    // Get total before pagination
-    const total = results.length;
-
-    // Apply pagination
-    const parsedLimit = parseInt(limit);
-    const parsedOffset = parseInt(offset);
-    results = results.slice(parsedOffset, parsedOffset + parsedLimit);
-
-    res.status(200).json({
+    res.json({
       success: true,
-      timestamp: new Date().toISOString(),
-      pagination: {
-        total: total,
-        limit: parsedLimit,
-        offset: parsedOffset,
-        hasMore: parsedOffset + parsedLimit < total
-      },
-      query: {
-        search: q || null,
-        country: country || null,
-        category: category || null,
-        nsfw: nsfw || null,
-        hasStreams: hasStreams || null
-      },
-      creator: "https://t.me/zerodevbro",
-      data: results
+      query: q,
+      data: enrichedResults,
+      total: enrichedResults.length
     });
+
   } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({
       success: false,
-      timestamp: new Date().toISOString(),
-      error: {
-        message: error.message,
-        code: "INTERNAL_ERROR"
-      },
-      creator: "https://t.me/zerodevbro"
+      error: 'Internal server error'
     });
   }
 };

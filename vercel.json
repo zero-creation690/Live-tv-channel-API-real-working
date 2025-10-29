@@ -1,20 +1,15 @@
 {
   "version": 2,
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
+    }
+  ],
   "routes": [
     {
-      "src": "/api/channels",
-      "methods": ["GET"],
-      "dest": "/api/channels.js"
-    },
-    {
-      "src": "/api/countries",
-      "methods": ["GET"],
-      "dest": "/api/countries.js"
-    },
-    {
-      "src": "/api/search",
-      "methods": ["GET"],
-      "dest": "/api/search.js"
+      "src": "/(.*)",
+      "dest": "api/index.py"
     }
   ]
 }

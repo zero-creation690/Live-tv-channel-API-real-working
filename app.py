@@ -1,6 +1,6 @@
-from flask import Flask, jsonify, request, redirect
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
-import requests, threading, time, orjson, urllib.parse, subprocess, os, uuid
+import requests, threading, time, orjson, subprocess, uuid, os
 
 app = Flask(__name__)
 CORS(app)
@@ -10,9 +10,8 @@ DATA = {"channels": [], "streams": [], "logos": [], "countries": []}
 SEARCH_INDEX = {}
 LAST_UPDATE = 0
 CACHE_DURATION = 3600 * 3  # 3 hours
+HLS_DIR = "hls_temp"
 
-# HLS temporary folder
-HLS_DIR = "/tmp/hls"
 os.makedirs(HLS_DIR, exist_ok=True)
 
 
@@ -44,6 +43,7 @@ def fetch_all_data():
             "alt": [a.lower() for a in ch.get("alt_names", [])],
             "country": ch.get("country"),
         }
+
     LAST_UPDATE = time.time()
     print("[INFO] IPTV data updated successfully.")
 
@@ -58,46 +58,63 @@ threading.Thread(target=fetch_all_data, daemon=True).start()
 threading.Thread(target=auto_refresh, daemon=True).start()
 
 
-# ------------------------ HLS CONVERTER ------------------------
-def generate_hls(stream_url):
-    """Create HLS playlist in /tmp/hls/<uuid>/index.m3u8"""
+# ------------------------ REAL HLS CONVERTER ------------------------
+def generate_hls(src_url):
+    """
+    Converts a stream to HLS on-the-fly using FFmpeg.
+    Returns the URL of the .m3u8 playlist.
+    """
     stream_id = str(uuid.uuid4())
-    out_dir = os.path.join(HLS_DIR, stream_id)
-    os.makedirs(out_dir, exist_ok=True)
-    out_m3u8 = os.path.join(out_dir, "index.m3u8")
+    playlist_path = os.path.join(HLS_DIR, f"{stream_id}.m3u8")
 
-    # Skip if already exists
-    if not os.path.exists(out_m3u8):
-        cmd = [
-            "ffmpeg", "-i", stream_url,
-            "-c:v", "copy", "-c:a", "aac",
-            "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments+omit_endlist",
-            out_m3u8
-        ]
-        subprocess.Popen(cmd)
-    return f"/tmp/hls/{stream_id}/index.m3u8"
+    # FFmpeg command
+    cmd = [
+        "ffmpeg",
+        "-y",                # overwrite
+        "-i", src_url,       # input stream
+        "-c:v", "copy",      # copy video codec
+        "-c:a", "aac",       # audio codec
+        "-f", "hls",
+        "-hls_time", "4",    # segment length
+        "-hls_list_size", "5",
+        "-hls_flags", "delete_segments",
+        playlist_path
+    ]
+
+    # Run FFmpeg as background process
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Return the m3u8 URL
+    return f"/hls/{stream_id}.m3u8"
+
+
+@app.route("/hls/<stream_file>")
+def hls_serve(stream_file):
+    path = os.path.join(HLS_DIR, stream_file)
+    if not os.path.exists(path):
+        return jsonify({"error": "Stream not found"}), 404
+
+    def generate():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024*8)
+                if not chunk:
+                    break
+                yield chunk
+    return Response(generate(), mimetype="application/vnd.apple.mpegurl")
 
 
 @app.route("/api/hls")
-def hls_proxy():
+def hls_api():
     src_url = request.args.get("url")
     if not src_url:
         return jsonify({"error": "Missing ?url parameter"}), 400
 
-    # If already .m3u8
-    if src_url.endswith(".m3u8"):
-        return redirect(src_url, code=302)
-
-    # Otherwise generate HLS
-    hls_path = generate_hls(src_url)
-    base = request.host_url.rstrip("/")
-    return redirect(f"{base}/hls/{os.path.basename(os.path.dirname(hls_path))}/index.m3u8", code=302)
+    playlist_url = generate_hls(src_url)
+    base_url = request.host_url.rstrip("/")
+    return jsonify({"hls_url": f"{base_url}{playlist_url}"})
 
 
-# ------------------------ CHANNEL COMBINE ------------------------
+# ------------------------ CHANNEL DATA ------------------------
 def combine_channel_data(channel):
     base = request.host_url.rstrip("/")
     streams = [s for s in DATA["streams"] if s.get("channel") == channel["id"]]
@@ -114,13 +131,12 @@ def combine_channel_data(channel):
         "logo": logo_url,
         "streams": [
             {
-                "url": f"{base}/api/hls?url={urllib.parse.quote(s['url'], safe='')}",
+                "url": f"{base}/api/hls?url={s['url']}",
                 "title": s.get("title"),
                 "quality": s.get("quality"),
                 "referrer": s.get("referrer"),
                 "user_agent": s.get("user_agent"),
-            }
-            for s in streams
+            } for s in streams
         ],
         "website": channel.get("website"),
         "is_nsfw": channel.get("is_nsfw", False),
@@ -133,16 +149,15 @@ def combine_channel_data(channel):
 @app.route("/")
 def home():
     return jsonify({
-        "message": "🚀 Ultra Fast IPTV API with Real HLS",
+        "message": "🚀 Real-time IPTV HLS API (FFmpeg)",
         "created_by": "https://t.me/zerodevbro",
         "uptime": f"{round((time.time() - LAST_UPDATE)/60, 1)} min since last refresh",
         "endpoints": {
             "/api/search?q=<name>": "Search channels by name",
             "/api/country/<code>": "Get all channels by country",
             "/api/countries": "List all countries",
-            "/api/channel/<id>": "Get specific channel details",
-            "/api/categories": "List all categories",
-            "/api/hls?url=<stream_url>": "Convert stream to HLS (playable)"
+            "/api/channel/<id>": "Get channel details",
+            "/api/hls?url=<stream_url>": "Convert any stream to HLS in real-time"
         }
     })
 
@@ -151,7 +166,7 @@ def home():
 def search():
     q = request.args.get("q", "").strip().lower()
     if not q:
-        return jsonify({"error": "Missing ?q="}), 400
+        return jsonify({"error": "Missing ?q=", "created_by": "https://t.me/zerodevbro"}), 400
 
     results = []
     for ch_id, ch in SEARCH_INDEX.items():
@@ -171,48 +186,6 @@ def search():
         status=200,
         mimetype="application/json"
     )
-
-
-@app.route("/api/countries")
-def list_countries():
-    counts = {}
-    for ch in DATA["channels"]:
-        cc = ch.get("country")
-        if cc:
-            counts[cc] = counts.get(cc, 0) + 1
-
-    countries = [
-        {"code": c["code"], "name": c["name"], "flag": c.get("flag"), "channel_count": counts.get(c["code"], 0)}
-        for c in DATA["countries"] if counts.get(c["code"], 0) > 0
-    ]
-    countries.sort(key=lambda x: x["channel_count"], reverse=True)
-    return jsonify({"total": len(countries), "countries": countries})
-
-
-@app.route("/api/country/<code>")
-def by_country(code):
-    code = code.upper()
-    channels = [ch for ch in DATA["channels"] if ch.get("country") == code]
-    results = [combine_channel_data(c) for c in channels[:50]]
-    return jsonify({"country": code, "total": len(results), "channels": results})
-
-
-@app.route("/api/channel/<ch_id>")
-def channel(ch_id):
-    channel = next((c for c in DATA["channels"] if c["id"] == ch_id), None)
-    if not channel:
-        return jsonify({"error": "Channel not found"}), 404
-    return jsonify({"channel": combine_channel_data(channel)})
-
-
-@app.route("/api/categories")
-def categories():
-    cats = {}
-    for ch in DATA["channels"]:
-        for cat in ch.get("categories", []):
-            cats[cat] = cats.get(cat, 0) + 1
-    result = [{"name": k, "count": v} for k, v in sorted(cats.items(), key=lambda x: x[1], reverse=True)]
-    return jsonify({"total": len(result), "categories": result})
 
 
 # ------------------------ RUN ------------------------

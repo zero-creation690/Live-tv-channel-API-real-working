@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests, threading, time, orjson
+from functools import lru_cache
 
 app = Flask(__name__)
 CORS(app)
@@ -8,12 +9,18 @@ CORS(app)
 BASE_URL = "https://iptv-org.github.io/api"
 DATA = {"channels": [], "streams": [], "logos": [], "countries": []}
 SEARCH_INDEX = {}
+STREAM_MAP = {}
+LOGO_MAP = {}
 LAST_UPDATE = 0
 CACHE_DURATION = 3600 * 3  # 3 hours
 
+def normalize_text(text):
+    """Normalize text for better search matching (preserves symbols like &)"""
+    return text.lower().strip()
+
 def fetch_all_data():
-    """Fetch all IPTV JSON data and preprocess"""
-    global DATA, SEARCH_INDEX, LAST_UPDATE
+    """Fetch all IPTV JSON data and preprocess with optimizations"""
+    global DATA, SEARCH_INDEX, STREAM_MAP, LOGO_MAP, LAST_UPDATE
     print("[INFO] Refreshing IPTV data...")
     urls = {
         "channels": f"{BASE_URL}/channels.json",
@@ -31,19 +38,42 @@ def fetch_all_data():
         print(f"[ERROR] Data fetch failed: {e}")
         return
 
-    # Build lowercase search index
+    # Build optimized lookup maps
     SEARCH_INDEX.clear()
+    STREAM_MAP.clear()
+    LOGO_MAP.clear()
+    
+    # Pre-index streams by channel ID for O(1) lookup
+    for s in DATA["streams"]:
+        ch_id = s.get("channel")
+        if ch_id:
+            if ch_id not in STREAM_MAP:
+                STREAM_MAP[ch_id] = []
+            STREAM_MAP[ch_id].append({
+                "url": s["url"],
+                "title": s.get("title"),
+                "quality": s.get("quality"),
+                "referrer": s.get("referrer"),
+                "user_agent": s.get("user_agent"),
+            })
+    
+    # Pre-index logos by channel ID for O(1) lookup
+    for l in DATA["logos"]:
+        ch_id = l.get("channel")
+        if ch_id and ch_id not in LOGO_MAP:
+            LOGO_MAP[ch_id] = l["url"]
+    
+    # Build normalized search index
     for ch in DATA["channels"]:
         SEARCH_INDEX[ch["id"]] = {
             "id": ch["id"],
-            "name": ch["name"].lower(),
-            "alt": [a.lower() for a in ch.get("alt_names", [])],
+            "name": normalize_text(ch["name"]),
+            "alt": [normalize_text(a) for a in ch.get("alt_names", [])],
             "country": ch.get("country"),
         }
 
     LAST_UPDATE = time.time()
-    print("[INFO] IPTV data updated successfully.")
-
+    print(f"[INFO] IPTV data updated: {len(DATA['channels'])} channels, {len(STREAM_MAP)} with streams")
 
 def auto_refresh():
     """Background thread to refresh cache periodically"""
@@ -51,67 +81,57 @@ def auto_refresh():
         time.sleep(CACHE_DURATION)
         fetch_all_data()
 
-
 # Start data fetching and refresh in background immediately
 threading.Thread(target=fetch_all_data, daemon=True).start()
 threading.Thread(target=auto_refresh, daemon=True).start()
 
-
 def combine_channel_data(channel):
-    """Combine channel with stream & logo"""
-    streams = [s for s in DATA["streams"] if s.get("channel") == channel["id"]]
-    logos = [l for l in DATA["logos"] if l.get("channel") == channel["id"]]
-    logo_url = logos[0]["url"] if logos else None
-
+    """Combine channel with stream & logo using pre-built maps (faster)"""
+    ch_id = channel["id"]
+    
     return {
-        "id": channel["id"],
+        "id": ch_id,
         "name": channel["name"],
         "alt_names": channel.get("alt_names", []),
         "country": channel.get("country"),
         "network": channel.get("network"),
         "categories": channel.get("categories", []),
-        "logo": logo_url,
-        "streams": [
-            {
-                "url": s["url"],
-                "title": s.get("title"),
-                "quality": s.get("quality"),
-                "referrer": s.get("referrer"),
-                "user_agent": s.get("user_agent"),
-            }
-            for s in streams
-        ],
+        "logo": LOGO_MAP.get(ch_id),
+        "streams": STREAM_MAP.get(ch_id, []),
         "website": channel.get("website"),
         "is_nsfw": channel.get("is_nsfw", False),
         "launched": channel.get("launched"),
         "created_by": "https://t.me/zerodevbro",
     }
 
-
 @app.route("/")
 def home():
     return jsonify({
-        "message": "🚀 IPTV Search API (Optimized for Koyeb)",
+        "message": "🚀 IPTV Search API (Optimized & Fast)",
         "created_by": "https://t.me/zerodevbro",
         "uptime": f"{round((time.time() - LAST_UPDATE)/60, 1)} min since last data refresh",
+        "total_channels": len(DATA["channels"]),
         "endpoints": {
-            "/api/search?q=<name>": "Search channels by name",
+            "/api/search?q=<name>": "Search channels by name (supports symbols like &Flix)",
             "/api/country/<code>": "Get all channels by country",
             "/api/countries": "List all countries",
-            "/api/channel/<id>": "Get channel details"
+            "/api/channel/<id>": "Get channel details",
+            "/api/categories": "List all categories"
         }
     })
 
-
 @app.route("/api/search")
 def search():
-    q = request.args.get("q", "").strip().lower()
+    q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "Missing ?q=", "created_by": "https://t.me/zerodevbro"}), 400
 
+    # Normalize search query to handle symbols
+    q_normalized = normalize_text(q)
+    
     results = []
     for ch_id, ch in SEARCH_INDEX.items():
-        if q in ch["name"] or any(q in alt for alt in ch["alt"]):
+        if q_normalized in ch["name"] or any(q_normalized in alt for alt in ch["alt"]):
             original = next(c for c in DATA["channels"] if c["id"] == ch_id)
             results.append(combine_channel_data(original))
             if len(results) >= 50:  # Limit for fast response
@@ -127,7 +147,6 @@ def search():
         status=200,
         mimetype="application/json"
     )
-
 
 @app.route("/api/countries")
 def list_countries():
@@ -149,12 +168,15 @@ def list_countries():
     ]
 
     countries.sort(key=lambda x: x["channel_count"], reverse=True)
-    return jsonify({
-        "total": len(countries),
-        "countries": countries,
-        "created_by": "https://t.me/zerodevbro"
-    })
-
+    return app.response_class(
+        response=orjson.dumps({
+            "total": len(countries),
+            "countries": countries,
+            "created_by": "https://t.me/zerodevbro"
+        }),
+        status=200,
+        mimetype="application/json"
+    )
 
 @app.route("/api/country/<code>")
 def by_country(code):
@@ -164,25 +186,31 @@ def by_country(code):
     if not channels:
         return jsonify({"error": f"No channels found for {code}"}), 404
 
-    results = [combine_channel_data(c) for c in channels[:50]]
-    return jsonify({
-        "country": code,
-        "total": len(results),
-        "channels": results,
-        "created_by": "https://t.me/zerodevbro"
-    })
-
+    results = [combine_channel_data(c) for c in channels[:100]]
+    return app.response_class(
+        response=orjson.dumps({
+            "country": code,
+            "total": len(results),
+            "channels": results,
+            "created_by": "https://t.me/zerodevbro"
+        }),
+        status=200,
+        mimetype="application/json"
+    )
 
 @app.route("/api/channel/<ch_id>")
 def channel(ch_id):
     channel = next((c for c in DATA["channels"] if c["id"] == ch_id), None)
     if not channel:
         return jsonify({"error": "Channel not found"}), 404
-    return jsonify({
-        "channel": combine_channel_data(channel),
-        "created_by": "https://t.me/zerodevbro"
-    })
-
+    return app.response_class(
+        response=orjson.dumps({
+            "channel": combine_channel_data(channel),
+            "created_by": "https://t.me/zerodevbro"
+        }),
+        status=200,
+        mimetype="application/json"
+    )
 
 @app.route("/api/categories")
 def categories():
@@ -191,12 +219,15 @@ def categories():
         for cat in ch.get("categories", []):
             cats[cat] = cats.get(cat, 0) + 1
     result = [{"name": k, "count": v} for k, v in sorted(cats.items(), key=lambda x: x[1], reverse=True)]
-    return jsonify({
-        "total": len(result),
-        "categories": result,
-        "created_by": "https://t.me/zerodevbro"
-    })
-
+    return app.response_class(
+        response=orjson.dumps({
+            "total": len(result),
+            "categories": result,
+            "created_by": "https://t.me/zerodevbro"
+        }),
+        status=200,
+        mimetype="application/json"
+    )
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
